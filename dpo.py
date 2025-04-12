@@ -3,14 +3,15 @@
 
 import argparse
 
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM
-from trl import SFTConfig, SFTTrainer
+from datasets import load_dataset, DatasetDict, concatenate_datasets, load_from_disk
+import datasets
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOConfig, DPOTrainer
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train model with SFT using Deepspeed."
+        description="Train model with DPO using Deepspeed."
     )
     parser.add_argument(
         "--model_path",
@@ -27,7 +28,7 @@ def main():
     parser.add_argument(
         "--dataset_path",
         type=str,
-        default="HuggingFaceTB/smoltalk",
+        default="./smol-magpie-ultra",
         help="Path to the dataset.",
     )
     parser.add_argument(
@@ -105,27 +106,32 @@ def main():
     args = parser.parse_args()
 
     # 모델 로드
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path=args.model_path,
+        cache_dir=args.cache_dir,
+        use_fast=True,
+    )
     model = AutoModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=args.model_path,
+        cache_dir=args.cache_dir,
+        attn_implementation="flash_attention_2" if args.use_flash_attention else "eager",
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         cache_dir=args.cache_dir,
         attn_implementation="flash_attention_2" if args.use_flash_attention else "eager",
     )
 
     # 데이터셋 로드
-    if not args.dataset_name:
-        args.dataset_name = None
-
-    ds = load_dataset(
-        "parquet",
-        data_dir=args.dataset_path,
-        # path=args.dataset_path,
-        # name=args.dataset_name,
-        cache_dir=args.cache_dir,
-        num_proc=32,
+    ds = load_from_disk(
+        args.dataset_path,
+        # cache_dir=args.cache_dir,
     )
-
     train_dataset = ds["train"]
     eval_dataset = ds["test"]
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Eval dataset size: {len(eval_dataset)}")
 
     # Deepspeed Stage 3 (Zero-3) 설정
     deepspeed_config = {
@@ -139,8 +145,8 @@ def main():
         "logging_config": {"log_rank_0_only": True},
     }
 
-    # SFTTrainer 설정
-    sft_config = SFTConfig(
+    # DPOTrainer 설정
+    dpo_config = DPOConfig(
         output_dir=args.save_path,
         per_device_train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -151,21 +157,21 @@ def main():
         evaluation_strategy=args.evaluation_strategy,
         eval_steps=args.eval_steps,
         bf16=True,
+        warmup_steps=100,
         deepspeed=deepspeed_config,
         dataset_num_proc=32,
-        max_length=args.max_sequence_length,
-        packing=True,
-        eval_packing=True,
         report_to="tensorboard",
         logging_dir=args.logging_dir,
     )
 
-    # SFTTrainer 초기화
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
+    # DPOTrainer 초기화
+    trainer = DPOTrainer(
+        model,
+        ref_model,
+        args=dpo_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        processing_class=tokenizer, # dpo processing
     )
 
     # 모델 학습

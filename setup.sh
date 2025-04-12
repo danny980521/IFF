@@ -1,7 +1,7 @@
 pip install -r requirements.txt
 
 cd lm-evaluation-harness
-pip install -e .[vllm,ifeval]
+pip install -e .[ifeval]
 cd ..
 
 cd FastChat

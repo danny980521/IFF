@@ -3,20 +3,28 @@
 
 import argparse
 
-from datasets import load_dataset
-from transformers import AutoModelForCausalLM
-from trl import SFTConfig, SFTTrainer
+import torch
+from datasets import load_dataset, DatasetDict
+import datasets
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+from trl import OnlineDPOConfig, OnlineDPOTrainer
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train model with SFT using Deepspeed."
+        description="Train model with DPO using Deepspeed."
     )
     parser.add_argument(
         "--model_path",
         type=str,
         default="models/kanana-nano-2.1b-base",
         help="Path to the pre-trained model.",
+    )
+    parser.add_argument(
+        "--reward_model_path",
+        type=str,
+        default="models/kanana-nano-2.1b-base",
+        help="Path to the reward model.",
     )
     parser.add_argument(
         "--save_path",
@@ -55,6 +63,12 @@ def main():
         "--learning_rate", type=float, default=5e-5, help="Learning rate for training."
     )
     parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum new tokens to generate during training.",
+    )
+    parser.add_argument(
         "--max_sequence_length",
         type=int,
         default=2048,
@@ -84,6 +98,11 @@ def main():
         help="Use flash attention for training.",
     )
     parser.add_argument(
+        "--use_vllm",
+        action="store_true",
+        help="Use VLLM for training.",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default="./cache",
@@ -105,9 +124,38 @@ def main():
     args = parser.parse_args()
 
     # 모델 로드
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path=args.model_path,
+        cache_dir=args.cache_dir,
+        use_fast=True,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         cache_dir=args.cache_dir,
+        torch_dtype=torch.bfloat16,
+        is_encoder_decoder=False,
+        attn_implementation="flash_attention_2" if args.use_flash_attention else "eager",
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=args.model_path,
+        cache_dir=args.cache_dir,
+        torch_dtype=torch.bfloat16,
+        is_encoder_decoder=False,
+        attn_implementation="flash_attention_2" if args.use_flash_attention else "eager",
+    )
+    # model.config.is_encoder_decoder = False
+    # ref_model.config.is_encoder_decoder = False
+
+    # reward model 로드
+    reward_tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path=args.reward_model_path,
+        cache_dir=args.cache_dir,
+        use_fast=True,
+    )
+    reward_model = AutoModelForSequenceClassification.from_pretrained(
+        pretrained_model_name_or_path=args.reward_model_path,
+        cache_dir=args.cache_dir,
+        torch_dtype=torch.float16,
         attn_implementation="flash_attention_2" if args.use_flash_attention else "eager",
     )
 
@@ -116,22 +164,43 @@ def main():
         args.dataset_name = None
 
     ds = load_dataset(
-        "parquet",
+        "json",
         data_dir=args.dataset_path,
-        # path=args.dataset_path,
-        # name=args.dataset_name,
         cache_dir=args.cache_dir,
         num_proc=32,
     )
 
-    train_dataset = ds["train"]
-    eval_dataset = ds["test"]
+    if isinstance(ds, DatasetDict):
+        if "test" not in ds:
+            split_dataset = ds["train"].train_test_split(
+                test_size=0.01, shuffle=True, seed=42
+            )
+            train_dataset = split_dataset["train"]
+            eval_dataset = split_dataset["test"]
+        else:
+            train_dataset = ds["train"]
+            eval_dataset = ds["test"]
+    else:
+        split_dataset = ds.train_test_split(
+            test_size=0.01, shuffle=True, seed=42
+        )
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
 
-    # Deepspeed Stage 3 (Zero-3) 설정
+    # change column name "question" to "prompt"
+    # https://github.com/huggingface/trl/blob/5a0cebc7869b0435b4e916a104e0b7b14a7f03f3/trl/data_utils.py#L118-L138
+    train_dataset = train_dataset.rename_column("question", "prompt")
+    eval_dataset = eval_dataset.rename_column("question", "prompt")
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Eval dataset size: {len(eval_dataset)}")
+
+    # # Deepspeed Stage 3 (Zero-3) 설정
     deepspeed_config = {
         "train_micro_batch_size_per_gpu": args.train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "zero_optimization": {
+            # "stage": 1,
             "stage": 3,
             "stage3_gather_16bit_weights_on_model_save": True,
         },
@@ -139,8 +208,8 @@ def main():
         "logging_config": {"log_rank_0_only": True},
     }
 
-    # SFTTrainer 설정
-    sft_config = SFTConfig(
+    # OnlineDPOConfig 설정
+    dpo_config = OnlineDPOConfig(
         output_dir=args.save_path,
         per_device_train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -151,21 +220,26 @@ def main():
         evaluation_strategy=args.evaluation_strategy,
         eval_steps=args.eval_steps,
         bf16=True,
-        deepspeed=deepspeed_config,
-        dataset_num_proc=32,
+        warmup_steps=100,
+        max_new_tokens=args.max_new_tokens,
         max_length=args.max_sequence_length,
-        packing=True,
-        eval_packing=True,
+        deepspeed=deepspeed_config,
+        use_vllm=args.use_vllm,
+        dataset_num_proc=32,
         report_to="tensorboard",
         logging_dir=args.logging_dir,
     )
 
-    # SFTTrainer 초기화
-    trainer = SFTTrainer(
+    # OnlineDPOTrainer 초기화
+    trainer = OnlineDPOTrainer(
         model=model,
-        args=sft_config,
+        ref_model=ref_model,
+        reward_model=reward_model,
+        args=dpo_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        processing_class=tokenizer, # dpo processing
+        reward_processing_class=reward_tokenizer, # reward processing
     )
 
     # 모델 학습

@@ -19,6 +19,15 @@ git clone https://huggingface.co/Qwen/Qwen2.5-32B-Instruct
 cd ..
 ```
 
+## (Optional) Install vLLM with existing torch
+```
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+python use_existing_torch.py
+pip install -r requirements/build.txt
+pip install -e . --no-build-isolation
+```
+
 ## SFT Train
 trl의 `SFTTrainer`를 사용해 학습하는 코드입니다.
 ```
@@ -48,9 +57,11 @@ bash eval.sh \
 ```
 
 ## Results
-| 모델 이름                                          | ifeval (inst, loose) | mt-bench (single, avg) |
-|--------------------------------------------------|----------------------|-------------------------|
-| kanana-nano-2.1b-base                            | 0.2614               | 4.50                    |
-| kanana-nano-2.1b-instruction                     | **0.7194**           | **5.79**                |
-| kanana-nano-2.1b-base-smol-magpie-ultra-1epoch   | 0.2998               | 4.24                    |
-
+| 모델 이름                                                 | ifeval (inst, loose) | mt-bench (single, avg)  |
+|---------------------------------------------------------|----------------------|-------------------------|
+| kanana-nano-2.1b-base                                   | 0.2614               | 4.50                    |
+| kanana-nano-2.1b-instruction                            | **0.7194**           | **5.79**                |
+| kanana-nano-2.1b-base-smol-magpie-ultra-1epoch          | 0.2998               | 4.24                    |
+| kanana-nano-2.1b-base-smoltalk-1epoch                   | 0.4521               | 5.4                     |
+| kanana-nano-2.1b-base-smoltalk-1epoch-dpo               | 0.4065               | 5.075                   |
+| kanana-nano-2.1b-base-smoltalk-1epoch-dpo-merged-3epoch | 0.4508               | 5.475                   |
